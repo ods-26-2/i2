@@ -1,0 +1,2 @@
+numpy==2.5.3
+confluent-kafka==2.16.0
