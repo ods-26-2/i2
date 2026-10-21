@@ -13,34 +13,49 @@ Só numpy + cliente Kafka.
 ```
 docker build -t inv-i2 .
 # csv de exemplo vem do repo a4, clonado ao lado
-cat ../a4/yolo/volei.csv ../a4/yolo/janela.csv | sort -t, -k1,1n | docker run -i --rm inv-i2 --fps 29.97 --largura 1280 --altura 720
+cat ../a4/old/yolo/volei.csv ../a4/old/yolo/janela.csv | sort -t, -k1,1n | docker run -i --rm inv-i2 --fps 29.97 --largura 1280 --altura 720
 # no barramento: mesmo comando + --kafka 34.66.235.91:9093
 ```
 
 Entrada (stdin): csv de detecções `quadro,t_s,x1,y1,x2,y2,classe,confianca`, **ordenado por
 quadro**. Linhas de cabeçalho são ignoradas, então dá para concatenar vários csv e passar
-por `sort`. É o formato do produtor falso `yolo/detectar.py` do [A4](https://github.com/ods-26-2/a4), até o I1 chegar;
-os csv de exemplo também estão lá (`yolo/volei.csv`, `yolo/janela.csv`).
+por `sort`. É o formato do produtor falso `old/yolo/detectar.py` do [A4](https://github.com/ods-26-2/a4), até o I1 chegar;
+os csv de exemplo também estão lá (`old/yolo/volei.csv`, `old/yolo/janela.csv`). O `detection_id` é a
+ordem da linha dentro do quadro, contada antes do corte de confiança.
 
-Saída: um evento `ods.visao.identidade_atribuida` por quadro, no formato de
-`docs/INV-1_interfaces.md`, como linha JSON no stdout ou, com `--kafka`, no tópico de mesmo nome. É streaming: cada quadro sai assim que o seguinte começa a
-chegar. A métrica `trocas_por_minuto` vai para o stderr.
+Saída: um evento `ods.i2.tracks` por quadro, no envelope EV-SINAL da arquitetura 6c, como
+linha JSON no stdout ou, com `--kafka`, no tópico de mesmo nome (chave `source_id`). É
+streaming: cada quadro sai assim que o seguinte começa a chegar. A métrica
+`trocas_por_minuto` vai para o stderr.
 
-Opções: `--camera-id --sessao --fps --largura --altura --inicio` (ISO do quadro 0, base do
+```json
+{"frame_index": 48, "tracks": [{"track_id": "t-ball-0001", "detection_id": 0, "class": "ball",
+  "state": "CONFIRMED", "predicted": false, "confidence": 0.78,
+  "point_px": [744.0, 271], "bbox": [739, 260, 749, 271]}]}
+```
+
+- `point_px` é o centro da base da `bbox`, o ponto que o S1 projeta pela homografia do I3.
+- `bbox` é a da detecção, sem suavização; com `predicted` ela é extrapolada e sai sem
+  `detection_id`.
+- `state` `LOST` sai uma vez, no quadro em que o rastro encerra. Objeto que volta recebe
+  `track_id` novo (decisão da 6c para a 1.0).
+
+Opções: `--source-id --sessao` (uuid; padrão é um novo) `--fps --largura --altura --inicio` (ISO do quadro 0, base do
 `captured_at`), `--conf-min bola=0.5,pessoa=0.3`, `--kafka HOST:PORTA`, `--objetos bola=1,pessoa=12`.
 
-Entram detecções de I1 (MOD-1). Consumidores: S1, S2, S5, A4.
+Entram detecções de I1 (MOD-1). Consumidores: S1 e S2.
 
-**Entrada** `Deteccao(caixa, classe, confianca)` + `t_s`, via `atualizar_quadro(t_s, deteccoes)`
+**Entrada** `Deteccao(caixa, classe, confianca, id)` + `t_s`, via `atualizar_quadro(t_s, deteccoes)`
 
 | campo | formato | observação |
 |---|---|---|
 | `caixa` | `(x1, y1, x2, y2)` em px | cantos superior esquerdo e inferior direito |
 | `classe` | str | `"bola"`, `"pessoa"` |
 | `confianca` | float 0 a 1 | do contrato de I1, ainda não usada |
+| `id` | int ou None | `detection_id` de I1 no quadro |
 | `t_s` | float em s | timestamp de **captura**, não de chegada |
 
-**Saída** `Trilha(id, classe, estado, centro, t_s, visto, vistas)`
+**Saída** `Trilha(id, classe, estado, centro, t_s, visto, vistas, caixa, deteccao, confianca)`
 
 | campo | formato | observação |
 |---|---|---|
@@ -48,6 +63,9 @@ Entram detecções de I1 (MOD-1). Consumidores: S1, S2, S5, A4.
 | `estado` | str | `tentativa`, `confirmada`, `perdida` |
 | `centro` | `(u, v)` em px | predito quando `visto` é falso |
 | `visto` | bool | houve detecção neste quadro ou é predição |
+| `caixa` | `(x1, y1, x2, y2)` em px | da detecção; deslocada com o centro quando predita |
+| `deteccao` | int ou None | id da detecção associada; None quando predita |
+| `confianca` | float 0 a 1 | da última detecção associada |
 
 **O que importa**
 

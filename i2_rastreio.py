@@ -4,10 +4,12 @@ from collections import namedtuple
 import numpy as np
 
 # entrada de i1, caixa em px e confianca de zero a um
-Deteccao = namedtuple("Deteccao", "caixa classe confianca")
+# id e o detection_id de i1 no quadro; sem id, a trilha sai sem detection_id
+Deteccao = namedtuple("Deteccao", "caixa classe confianca id", defaults=[None])
 
-# saida, estado pode ser tentativa confirmada ou perdida
-Trilha = namedtuple("Trilha", "id classe estado centro t_s visto vistas")
+# saida, estado pode ser tentativa confirmada ou perdida. caixa e a da deteccao, sem
+# suavizacao (extrapolada quando predita); deteccao e o id dela, ou None quando predita
+Trilha = namedtuple("Trilha", "id classe estado centro t_s visto vistas caixa deteccao confianca")
 
 ParametrosCamera = namedtuple("ParametrosCamera", "camera_id fps largura_px altura_px retificado")
 
@@ -60,10 +62,13 @@ class Rastreador:
         """
         centros = [centro(d.caixa) for d in deteccoes]           # centro de cada deteccao
         vistos, usadas = self._associar(t_s, centros, deteccoes)  # casa trilha com deteccao
+        encerradas = []                                            # confirmadas que morrem neste quadro
         for tid, tr in self.trilhas.items():                      # quem nao associou ou sumiu mais um quadro
             if tid not in vistos and tr["estado"] != "perdida":
                 tr["sumido"] += 1
                 if tr["sumido"] > self.p["perder_apos"]:
+                    if tr["estado"] == "confirmada":
+                        encerradas.append(self._publicar(tr, t_s, False)._replace(estado="perdida"))
                     tr["estado"] = "perdida"                      # perdido
         for i, d in enumerate(deteccoes):                          # deteccao que sobrou e objeto novo
             if i not in usadas:
@@ -71,8 +76,9 @@ class Rastreador:
         # trilha perdida nunca mais e associada: guardar todas faz o laco de
         # associacao percorrer o jogo inteiro a cada quadro
         self.trilhas = {tid: tr for tid, tr in self.trilhas.items() if tr["estado"] != "perdida"}
-        return [self._publicar(tr, t_s, tr["id"] in vistos)        # so publica quem ja confirmou
-                for tr in self.trilhas.values() if tr["estado"] == "confirmada"]
+        # so publica quem ja confirmou; a perdida sai uma vez, no quadro em que encerra (6c)
+        return [self._publicar(tr, t_s, tr["id"] in vistos)
+                for tr in self.trilhas.values() if tr["estado"] == "confirmada"] + encerradas
 
     def _associar(self, t_s, centros, deteccoes):
         """casa trilha com deteccao pela posicao predita, do mais perto pro mais longe
@@ -157,7 +163,9 @@ class Rastreador:
         card I2.2 · oclusao -- sprint 2, etapa 4a (Lara): mantem last-known por N quadros
         """
         pos = tr["pos"] if visto else self._predizer(tr, t_s)
-        return Trilha(tr["id"], tr["classe"], tr["estado"], tuple(pos), t_s, visto, tr["vistas"])
+        caixa = tr["caixa"] + np.tile(pos - tr["pos"], 2)   # predita: a caixa anda com o centro
+        return Trilha(tr["id"], tr["classe"], tr["estado"], tuple(pos), t_s, visto, tr["vistas"],
+                      tuple(caixa), tr["det_id"] if visto else None, tr["confianca"])
 
     def _nascer(self, t_s, d, c):
         """abre identidade nova pra deteccao que nao casou com nenhuma trilha
@@ -168,7 +176,8 @@ class Rastreador:
         """
         self.trilhas[self.proximo_id] = {
             "id": self.proximo_id, "classe": d.classe, "estado": "tentativa",
-            "pos": c, "vel": np.zeros(2), "t": t_s, "vistas": 1, "sumido": 0}
+            "pos": c, "vel": np.zeros(2), "t": t_s, "vistas": 1, "sumido": 0,
+            "caixa": np.array(d.caixa, float), "det_id": d.id, "confianca": d.confianca}
         self.proximo_id += 1
 
     def _atualizar(self, tid, t_s, d, c):
@@ -181,6 +190,7 @@ class Rastreador:
         if dt > 1e-3:   # dt quase zero (duas fontes com o mesmo t_s) explodiria a velocidade
             tr["vel"] = a * (c - tr["pos"]) / dt + (1 - a) * tr["vel"]
         tr["pos"], tr["t"], tr["sumido"] = c, t_s, 0
+        tr["caixa"], tr["det_id"], tr["confianca"] = np.array(d.caixa, float), d.id, d.confianca
         tr["vistas"] += 1
         if tr["vistas"] >= self.p["confirmar_em"] and tr["estado"] != "confirmada":
             tr["estado"] = "confirmada"
@@ -248,4 +258,20 @@ if __name__ == "__main__":
     (t,) = r.atualizar_quadro(13 * 0.033, [Deteccao((200, 100, 210, 110), "bola", 0.9)])
     assert (t.id, t.visto) == (1, True), f"a bola voltou com id novo: {t.id}"
     assert r.confirmadas == 1, f"bola longa nao pode criar identidade, criou {r.confirmadas}"
+
+    # 6c: a trilha leva a caixa e o id da deteccao; predita, a caixa anda e o id some;
+    # ao encerrar sai uma vez como perdida e depois nunca mais
+    r = Rastreador("bola")
+    for i in range(3):
+        x = 100 + 10 * i
+        saida = r.atualizar_quadro(i * 0.1, [Deteccao((x, 100, x + 10, 110), "bola", 0.8, 7)])
+    (t,) = saida
+    assert (t.caixa, t.deteccao, t.confianca) == ((120, 100, 130, 110), 7, 0.8), t
+    (t,) = r.atualizar_quadro(0.3, [])
+    assert t.deteccao is None, "predita nao tem deteccao associada"
+    assert abs(t.caixa[0] + 5 - t.centro[0]) < 1e-6 and t.caixa[0] > 120, f"caixa parada: {t.caixa}"
+    saidas = [r.atualizar_quadro(0.3 + 0.1 * i, []) for i in range(1, 25)]
+    perdidas = [tr for s in saidas for tr in s if tr.estado == "perdida"]
+    assert len(perdidas) == 1, f"perdida tinha que sair uma vez, saiu {len(perdidas)}"
+    assert saidas[-1] == [], "depois de perdida a trilha nao pode voltar a sair"
     print("ok")

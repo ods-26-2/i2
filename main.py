@@ -5,9 +5,9 @@
 
 entrada no formato do yolo/detectar.py (o produtor falso do i1):
 quadro,t_s,x1,y1,x2,y2,classe,confianca -- ordenada por quadro, cabecalho e ignorado.
-saida: um evento por quadro, envelope do guia kafka b2 (docs/Guia_Kafka_B2_v2.pdf).
-com --kafka vai pro topico ods.visao.identidade_atribuida, chave camera_id (mesma
-particao, ordem dos quadros preservada); sem --kafka, uma linha json no stdout.
+saida: um evento ods.i2.tracks por quadro, envelope ev-sinal da arquitetura 6c.
+com --kafka vai pro topico de mesmo nome, chave source_id (mesma particao, ordem dos
+quadros preservada); sem --kafka, uma linha json no stdout.
 e streaming: o quadro sai assim que o seguinte comeca.
 """
 import argparse
@@ -20,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 
 from i2_rastreio import Deteccao, ParametrosCamera, Rastreador
 
-TOPICO = "ods.visao.identidade_atribuida"
+TOPICO = "ods.i2.tracks"
+VERSAO = "i2-rastreio-1.0"                        # artifact_version: o motor que rastreou
 CLASSE = {"bola": "ball", "pessoa": "person"}   # enum do contrato de i1
 
 
@@ -38,6 +39,7 @@ def por_classe(texto, padrao):
 def quadros(linhas):
     """agrupa as linhas do csv por quadro, sem esperar o fim da entrada"""
     atual, t_atual, dets = None, 0.0, []
+    # detection_id e a ordem no quadro, contada antes do corte de confianca, como i1 faria
     for r in csv.reader(linhas):
         if not r or r[0] == "quadro":
             continue
@@ -46,7 +48,7 @@ def quadros(linhas):
             yield atual, t_atual, dets
             dets = []
         atual, t_atual = n, float(r[1])
-        dets.append(Deteccao(tuple(map(float, r[2:6])), r[6], float(r[7])))
+        dets.append(Deteccao(tuple(map(float, r[2:6])), r[6], float(r[7]), len(dets)))
     if atual is not None:
         yield atual, t_atual, dets
 
@@ -69,7 +71,7 @@ def saida(a):
     produtor, falhas = Producer({"bootstrap.servers": a.kafka}), []
 
     def publicar(ev):
-        produtor.produce(TOPICO, key=a.camera_id, value=json.dumps(ev).encode(),
+        produtor.produce(TOPICO, key=a.source_id, value=json.dumps(ev).encode(),
                          on_delivery=lambda erro, _msg: erro and falhas.append(erro))
         produtor.poll(0)                 # entrega os callbacks sem bloquear
 
@@ -80,37 +82,45 @@ def saida(a):
     return publicar, fechar
 
 
+def rastro(tr):
+    """trilha no formato de ods.i2.tracks; point_px e o centro da base, o que s1 projeta"""
+    x1, y1, x2, y2 = (round(float(v)) for v in tr.caixa)
+    item = {"track_id": f"t-{CLASSE.get(tr.classe, tr.classe)}-{tr.id:04d}",
+            "class": CLASSE.get(tr.classe, tr.classe),
+            "state": "LOST" if tr.estado == "perdida" else "CONFIRMED",
+            "predicted": not tr.visto, "confidence": round(float(tr.confianca), 3),
+            "point_px": [round((x1 + x2) / 2, 1), y2], "bbox": [x1, y1, x2, y2]}
+    if tr.deteccao is not None:
+        item["detection_id"] = tr.deteccao
+    return item
+
+
 def main(a):
     publicar, fechar = saida(a)
-    cam = ParametrosCamera(a.camera_id, a.fps, a.largura, a.altura, False)
+    cam = ParametrosCamera(a.source_id, a.fps, a.largura, a.altura, False)
     inicio = datetime.fromisoformat(a.inicio.replace("Z", "+00:00")) if a.inicio \
         else datetime.now(timezone.utc)
     conf_min = por_classe(a.conf_min, 0.0)
     rastreadores = {}
-    n, t_s = -1, 0.0
+    n, t_s, sequencia = -1, 0.0, 0
     for n, t_s, dets in quadros(sys.stdin):
         dets = [d for d in dets if d.confianca >= conf_min[d.classe]]
         trilhas = rastrear(rastreadores, cam, t_s, dets)
-        capturado = iso(inicio + timedelta(seconds=t_s))
         publicar({
-            "message_id": str(uuid.uuid4()),
             "message_type": "event",
+            "message_id": str(uuid.uuid4()),
             "schema": TOPICO,
             "schema_version": "1.0",
             "producer": "I2",
-            "occurred_at": capturado,
             "published_at": iso(datetime.now(timezone.utc)),
-            "payload": {
-                "camera_id": a.camera_id,
-                "session_id": a.sessao,
-                "captured_at": capturado,
-                "frame": n,
-                "tracks": [{"track_id": tr.id, "class": CLASSE.get(tr.classe, tr.classe),
-                            "state": "confirmed", "u_px": round(float(tr.centro[0]), 1),
-                            "v_px": round(float(tr.centro[1]), 1), "predicted": not tr.visto}
-                           for tr in trilhas],
-            },
+            "captured_at": iso(inicio + timedelta(seconds=t_s)),
+            "source_id": a.source_id,
+            "session_id": a.sessao,
+            "sequence": sequencia,
+            "artifact_version": VERSAO,
+            "payload": {"frame_index": n, "tracks": [rastro(tr) for tr in trilhas]},
         })
+        sequencia += 1
     fechar()
 
     # card I2.3: o numero so vale com o cenario declarado junto
@@ -125,8 +135,9 @@ def main(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--camera-id", default="cam-ref")
-    p.add_argument("--sessao", default="sessao-1")
+    p.add_argument("--source-id", default="cam-ref")
+    p.add_argument("--sessao", default=str(uuid.uuid4()),
+                   help="session_id (uuid) de ods.session.started; padrao e um novo")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--largura", type=int, default=1920)
     p.add_argument("--altura", type=int, default=1080)
