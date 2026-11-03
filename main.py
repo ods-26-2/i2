@@ -1,10 +1,13 @@
-"""borda do i2: csv de deteccoes no stdin -> um evento de rastreio por quadro no stdout
+"""borda do i2: deteccoes do i1 -> um evento de rastreio por quadro
 
     cat volei.csv janela.csv | sort -t, -k1,1n | docker run -i --rm inv-i2 --fps 29.97
     ... | docker run -i --rm inv-i2 --fps 29.97 --kafka 34.66.235.91:9093
+    docker run --rm --network host inv-i2 --i1 localhost:9092 --kafka localhost:9092
 
-entrada no formato do yolo/detectar.py (o produtor falso do i1):
-quadro,t_s,x1,y1,x2,y2,classe,confianca -- ordenada por quadro, cabecalho e ignorado.
+entrada: com --i1, o topico ods.i1.detections (6c), ao vivo, com captured_at, source_id e
+session_id de cada quadro repassados; sem --i1, csv no stdin no formato do
+old/yolo/detectar.py: quadro,t_s,x1,y1,x2,y2,classe,confianca -- ordenada por quadro,
+cabecalho e ignorado.
 saida: um evento ods.i2.tracks por quadro, envelope ev-sinal da arquitetura 6c.
 com --kafka vai pro topico de mesmo nome, chave source_id (mesma particao, ordem dos
 quadros preservada); sem --kafka, uma linha json no stdout.
@@ -21,8 +24,10 @@ from datetime import datetime, timedelta, timezone
 from i2_rastreio import Deteccao, ParametrosCamera, Rastreador
 
 TOPICO = "ods.i2.tracks"
+ENTRADA = "ods.i1.detections"
 VERSAO = "i2-rastreio-1.0"                        # artifact_version: o motor que rastreou
 CLASSE = {"bola": "ball", "pessoa": "person"}   # enum do contrato de i1
+PERFIL = {v: k for k, v in CLASSE.items()}       # classe do modelo de i1 -> perfil do rastreador
 
 
 def iso(t):
@@ -53,6 +58,52 @@ def quadros(linhas):
         yield atual, t_atual, dets
 
 
+def do_csv(a):
+    """stdin csv -> (sessao, fonte, quadro, t_s, captured_at, deteccoes); sessao e tempo dos args"""
+    inicio = datetime.fromisoformat(a.inicio.replace("Z", "+00:00")) if a.inicio \
+        else datetime.now(timezone.utc)
+    for n, t_s, dets in quadros(sys.stdin):
+        yield a.sessao, a.source_id, n, t_s, iso(inicio + timedelta(seconds=t_s)), dets
+
+
+def do_i1(a):
+    """ods.i1.detections ao vivo -> mesma tupla de do_csv; t_s e o epoch do captured_at"""
+    from confluent_kafka import OFFSET_END, Consumer
+
+    def fim(c, particoes):                          # fluxo: so dagora em diante
+        for p in particoes:
+            p.offset = OFFSET_END
+        c.assign(particoes)
+    c = Consumer({"bootstrap.servers": a.i1, "group.id": f"I2-{uuid.uuid4().hex[:8]}",
+                  "enable.auto.commit": False, "topic.metadata.refresh.interval.ms": 5000})
+    c.subscribe([ENTRADA], on_assign=fim)
+    ultimo = {}                                     # (fonte, sessao) -> ultimo frame_index
+    try:
+        while True:
+            msg = c.poll(0.5)
+            if msg is None or msg.error():
+                continue
+            try:
+                ev = json.loads(msg.value())
+                if ev["schema"] != ENTRADA or not str(ev["schema_version"]).startswith("1."):
+                    raise ValueError(f"schema {ev['schema']} {ev['schema_version']}")
+                chave, n = (ev["source_id"], ev["session_id"]), ev["payload"]["frame_index"]
+                dets = [Deteccao(tuple(map(float, d["bbox"])), PERFIL[d["class"]],
+                                 float(d["confidence"]), d["detection_id"])
+                        for d in ev["payload"]["detections"] if d["class"] in PERFIL]
+                t_s = datetime.fromisoformat(ev["captured_at"].replace("Z", "+00:00")).timestamp()
+            except (ValueError, KeyError, TypeError) as erro:
+                print(f"i2: mensagem descartada de {ENTRADA}: {erro!r}", file=sys.stderr)
+                continue
+            # repetida ou fora de ordem: o rastreador precisa do tempo andando para frente
+            if n <= ultimo.get(chave, -1):
+                continue
+            ultimo[chave] = n
+            yield ev["session_id"], ev["source_id"], n, t_s, ev["captured_at"], dets
+    finally:
+        c.close()
+
+
 def rastrear(rastreadores, cam, t_s, deteccoes):
     """um rastreador por classe, e todos rodam todo quadro -- e no quadro sem
     deteccao que a trilha prediz e segura a identidade"""
@@ -71,7 +122,7 @@ def saida(a):
     produtor, falhas = Producer({"bootstrap.servers": a.kafka}), []
 
     def publicar(ev):
-        produtor.produce(TOPICO, key=a.source_id, value=json.dumps(ev).encode(),
+        produtor.produce(TOPICO, key=ev["source_id"], value=json.dumps(ev).encode(),
                          on_delivery=lambda erro, _msg: erro and falhas.append(erro))
         produtor.poll(0)                 # entrega os callbacks sem bloquear
 
@@ -95,41 +146,49 @@ def rastro(tr):
     return item
 
 
-def main(a):
-    publicar, fechar = saida(a)
-    cam = ParametrosCamera(a.source_id, a.fps, a.largura, a.altura, False)
-    inicio = datetime.fromisoformat(a.inicio.replace("Z", "+00:00")) if a.inicio \
-        else datetime.now(timezone.utc)
-    conf_min = por_classe(a.conf_min, 0.0)
-    rastreadores = {}
-    n, t_s, sequencia = -1, 0.0, 0
-    for n, t_s, dets in quadros(sys.stdin):
-        dets = [d for d in dets if d.confianca >= conf_min[d.classe]]
-        trilhas = rastrear(rastreadores, cam, t_s, dets)
-        publicar({
-            "message_type": "event",
-            "message_id": str(uuid.uuid4()),
-            "schema": TOPICO,
-            "schema_version": "1.0",
-            "producer": "I2",
-            "published_at": iso(datetime.now(timezone.utc)),
-            "captured_at": iso(inicio + timedelta(seconds=t_s)),
-            "source_id": a.source_id,
-            "session_id": a.sessao,
-            "sequence": sequencia,
-            "artifact_version": VERSAO,
-            "payload": {"frame_index": n, "tracks": [rastro(tr) for tr in trilhas]},
-        })
-        sequencia += 1
-    fechar()
-
-    # card I2.3: o numero so vale com o cenario declarado junto
-    duracao = max(t_s, 1.0 / a.fps)
+def relatorio(a, rastreadores, duracao, quadros_vistos):
+    """card I2.3: o numero so vale com o cenario declarado junto"""
+    duracao = max(duracao, 1.0 / a.fps)
     esperado = por_classe(a.objetos, 1)
     for classe, r in sorted(rastreadores.items()):
         print(f"i2 {classe:7s}: {r.trocas_por_minuto(duracao, int(esperado[classe])):5.1f} "
               f"trocas/min ({r.confirmadas} confirmadas em {duracao:.1f}s, "
-              f"{n + 1} quadros)", file=sys.stderr)
+              f"{quadros_vistos} quadros)", file=sys.stderr)
+
+
+def main(a):
+    publicar, fechar = saida(a)
+    cam = ParametrosCamera(a.source_id, a.fps, a.largura, a.altura, False)
+    conf_min = por_classe(a.conf_min, 0.0)
+    rastreadores, sessao, sequencia, t_ini, t_s = {}, None, 0, 0.0, 0.0
+    try:
+        for sess, fonte, n, t_s, capturado, dets in (do_i1(a) if a.i1 else do_csv(a)):
+            # 6c: a identidade termina com a sessao, e sequence conta por sessao
+            if sess != sessao:
+                if sessao is not None:
+                    relatorio(a, rastreadores, t_s - t_ini, sequencia)
+                rastreadores, sessao, sequencia, t_ini = {}, sess, 0, t_s
+            dets = [d for d in dets if d.confianca >= conf_min[d.classe]]
+            trilhas = rastrear(rastreadores, cam, t_s, dets)
+            publicar({
+                "message_type": "event",
+                "message_id": str(uuid.uuid4()),
+                "schema": TOPICO,
+                "schema_version": "1.0",
+                "producer": "I2",
+                "published_at": iso(datetime.now(timezone.utc)),
+                "captured_at": capturado,
+                "source_id": fonte,
+                "session_id": sessao,
+                "sequence": sequencia,
+                "artifact_version": VERSAO,
+                "payload": {"frame_index": n, "tracks": [rastro(tr) for tr in trilhas]},
+            })
+            sequencia += 1
+    except KeyboardInterrupt:                     # ao vivo so para no ctrl+c
+        pass
+    fechar()
+    relatorio(a, rastreadores, t_s - t_ini, sequencia)
 
 
 if __name__ == "__main__":
@@ -145,6 +204,8 @@ if __name__ == "__main__":
     p.add_argument("--conf-min", default="",
                    help="corte de confianca por classe, ex. bola=0.5,pessoa=0.3")
     p.add_argument("--kafka", metavar="HOST:PORTA", help="publica no broker em vez do stdout")
+    p.add_argument("--i1", metavar="HOST:PORTA",
+                   help="le ods.i1.detections do broker em vez do csv no stdin")
     p.add_argument("--objetos", default="",
                    help="densidade declarada do cenario, ex. bola=1,pessoa=12")
     main(p.parse_args())
