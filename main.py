@@ -161,6 +161,10 @@ def main(a):
     cam = ParametrosCamera(a.source_id, a.fps, a.largura, a.altura, False)
     conf_min = por_classe(a.conf_min, 0.0)
     rastreadores, sessao, sequencia, t_ini, t_s = {}, None, 0, 0.0, 0.0
+    bola = None
+    if a.bola_modelo:
+        from bola_temporal import BolaTemporal
+        bola = BolaTemporal(a.bola_modelo, a.video)
     try:
         for sess, fonte, n, t_s, capturado, dets in (do_i1(a) if a.i1 else do_csv(a)):
             # 6c: a identidade termina com a sessao, e sequence conta por sessao
@@ -168,7 +172,11 @@ def main(a):
                 if sessao is not None:
                     relatorio(a, rastreadores, t_s - t_ini, sequencia)
                 rastreadores, sessao, sequencia, t_ini = {}, sess, 0, t_s
+                if bola is not None:
+                    bola.reiniciar()
             dets = [d for d in dets if d.confianca >= conf_min[d.classe]]
+            if bola is not None:                  # a bola vem do MODEL temporal, as demais do I1
+                dets = [d for d in dets if d.classe != "bola"] + bola.deteccoes(n)
             trilhas = rastrear(rastreadores, cam, t_s, dets)
             publicar({
                 "message_type": "event",
@@ -181,7 +189,7 @@ def main(a):
                 "source_id": fonte,
                 "session_id": sessao,
                 "sequence": sequencia,
-                "artifact_version": VERSAO,
+                "artifact_version": VERSAO + ("+" + a.bola_versao if bola is not None else ""),
                 "payload": {"frame_index": n, "tracks": [rastro(tr) for tr in trilhas]},
             })
             sequencia += 1
@@ -206,6 +214,10 @@ if __name__ == "__main__":
     p.add_argument("--kafka", metavar="HOST:PORTA", help="publica no broker em vez do stdout")
     p.add_argument("--i1", metavar="HOST:PORTA",
                    help="le ods.i1.detections do broker em vez do csv no stdin")
+    p.add_argument("--bola-modelo", metavar="ONNX",
+                   help="MODEL temporal da bola (VballNet); troca a bola do I1 pela do modelo")
+    p.add_argument("--bola-versao", default="vballnet-v4c", help="artifact_version do MODEL da bola")
+    p.add_argument("--video", help="stream de video (P4, ou a gravacao do P6 em replay) do --bola-modelo")
     p.add_argument("--objetos", default="",
                    help="densidade declarada do cenario, ex. bola=1,pessoa=12")
     main(p.parse_args())
