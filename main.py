@@ -209,7 +209,10 @@ if __name__ == "__main__":
     p.add_argument("--largura", type=int, default=1920)
     p.add_argument("--altura", type=int, default=1080)
     p.add_argument("--inicio", help="ISO 8601 UTC do quadro 0; padrao e agora")
-    p.add_argument("--conf-min", default="",
+    # bola=0.35: no gabarito de 120 quadros do video do A4 o acerto e o mesmo do 0.25 do I1
+    # (0.73) e cai 30% do que fica parado no clipe (logo redondo, antena, tenis); acima disso
+    # ja perde bola de verdade
+    p.add_argument("--conf-min", default="bola=0.35",
                    help="corte de confianca por classe, ex. bola=0.5,pessoa=0.3")
     p.add_argument("--kafka", metavar="HOST:PORTA", help="publica no broker em vez do stdout")
     p.add_argument("--i1", metavar="HOST:PORTA",
