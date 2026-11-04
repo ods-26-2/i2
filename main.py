@@ -25,7 +25,7 @@ from i2_rastreio import Deteccao, ParametrosCamera, Rastreador
 
 TOPICO = "ods.i2.tracks"
 ENTRADA = "ods.i1.detections"
-VERSAO = "i2-rastreio-1.0"                        # artifact_version: o motor que rastreou
+VERSAO = "i2-rastreio-1.1"                        # artifact_version: o motor que rastreou
 CLASSE = {"bola": "ball", "pessoa": "person"}   # enum do contrato de i1
 PERFIL = {v: k for k, v in CLASSE.items()}       # classe do modelo de i1 -> perfil do rastreador
 

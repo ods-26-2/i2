@@ -1,4 +1,5 @@
 """i2 identidade e rastreio -- sprint 2"""
+import math
 from collections import namedtuple
 
 import numpy as np
@@ -18,7 +19,9 @@ PERFIS = {
     "pessoa": {"dist_max_px": 90, "ambiguo_px": 45, "confirmar_em": 3,
                "perder_apos": 20, "suavizacao": 0.5,
                "cresce": 0.0, "teto": 1.0, "horizontes_s": 60.0},
-    "bola": {"dist_max_px": 60, "ambiguo_px": 30, "confirmar_em": 2,
+    # bola: 3 vistas para confirmar, porque 2 pontos quaisquer fazem uma reta e o falso
+    # positivo do detector confirmava no segundo quadro
+    "bola": {"dist_max_px": 60, "ambiguo_px": 30, "confirmar_em": 3,
              "perder_apos": 20, "suavizacao": 0.8,
              "cresce": 0.25, "teto": 3.0, "horizontes_s": 0.2},
 }
@@ -51,6 +54,10 @@ class Rastreador:
             # tolerancia de oclusao constante em segundos, nao em quadros
             fator_fps = camera.fps / FPS_REF
             self.p["perder_apos"] = max(1, round(self.p["perder_apos"] * fator_fps))
+        # a trilha so sobrevive sem deteccao enquanto a predicao vale: depois do horizonte
+        # ela parava no lugar e saia como posicao inventada, parada, quadro apos quadro
+        fps = camera.fps if camera is not None else FPS_REF
+        self.p["perder_apos"] = min(self.p["perder_apos"], max(1, math.ceil(self.p["horizontes_s"] * fps)))
         self.trilhas, self.proximo_id, self.confirmadas = {}, 1, 0
 
     def atualizar_quadro(self, t_s, deteccoes):
@@ -208,12 +215,13 @@ if __name__ == "__main__":
     metade_fps = ParametrosCamera("cam1", FPS_REF / 2, LARGURA_REF_PX, 1080, True)
     r = Rastreador("bola", metade_fps)
     assert r.p["dist_max_px"] == 120, f"fps pela metade devia dobrar o raio, deu {r.p['dist_max_px']}"
-    assert r.p["perder_apos"] == 10, (
-        f"fps pela metade devia reduzir perder_apos a metade (mesma tolerancia em "
-        f"segundos), deu {r.p['perder_apos']}")
+    assert r.p["perder_apos"] == 3, (
+        f"a 15 fps o horizonte de 0,2 s da bola sao 3 quadros, deu {r.p['perder_apos']}")
 
     r = Rastreador("bola", dobro_res)
-    assert r.p["perder_apos"] == 20, "so a resolucao mudar nao pode afetar perder_apos"
+    assert r.p["perder_apos"] == 6, "so a resolucao mudar nao pode afetar perder_apos"
+    assert Rastreador("pessoa", dobro_res).p["perder_apos"] == 20, \
+        "pessoa tem horizonte longo: a vida dela continua sendo o perder_apos do perfil"
 
     assert PERFIS["bola"]["dist_max_px"] == 60, "escalar nao pode vazar pro dict global"
     assert PERFIS["bola"]["perder_apos"] == 20, "escalar nao pode vazar pro dict global"
@@ -244,20 +252,19 @@ if __name__ == "__main__":
     assert a.centro[0] > b.centro[0], "quem vinha da esquerda tem que terminar a direita"
     assert r.confirmadas == 2, f"cruzamento nao pode criar identidade, criou {r.confirmadas}"
 
+    # depois do horizonte a predicao nao vale mais: a trilha encerra em vez de ficar parada
+    # no ultimo ponto, que saia como posicao inventada. a bola que volta e objeto novo (6c 1.0)
     r = Rastreador("bola")
     for i in range(3):                       # bola andando 10 px por quadro
         x = 100 + 10 * i
         r.atualizar_quadro(i * 0.033, [Deteccao((x, 100, x + 10, 110), "bola", 0.9)])
-        
-    ultima = None
-    for i in range(3, 13):     
-        anterior = ultima
-        (ultima,) = r.atualizar_quadro(i * 0.033, [])
-        assert not ultima.visto
-    assert anterior.centro == ultima.centro, "depois do horizonte a predicao tinha que parar"
-    (t,) = r.atualizar_quadro(13 * 0.033, [Deteccao((200, 100, 210, 110), "bola", 0.9)])
-    assert (t.id, t.visto) == (1, True), f"a bola voltou com id novo: {t.id}"
-    assert r.confirmadas == 1, f"bola longa nao pode criar identidade, criou {r.confirmadas}"
+    publicadas = [r.atualizar_quadro(i * 0.033, []) for i in range(3, 13)]
+    preditas = [t for q in publicadas for t in q if t.estado == "confirmada"]
+    assert all(not t.visto for t in preditas)
+    assert len({t.centro for t in preditas}) == len(preditas), "predita parada no lugar e posicao inventada"
+    assert any(t.estado == "perdida" for q in publicadas for t in q), "passado o horizonte a trilha encerra"
+    assert r.atualizar_quadro(13 * 0.033, [Deteccao((200, 100, 210, 110), "bola", 0.9)]) == [], \
+        "a bola que volta nasce como tentativa, sem herdar a identidade encerrada"
 
     # 6c: a trilha leva a caixa e o id da deteccao; predita, a caixa anda e o id some;
     # ao encerrar sai uma vez como perdida e depois nunca mais
