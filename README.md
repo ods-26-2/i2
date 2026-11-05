@@ -1,87 +1,113 @@
 # I2 · identidade e rastreio
 
-Parte do INV-1 · ODS 2026/2. O squad tem três componentes, cada um no seu repositório
-e no seu container: [I2](https://github.com/ods-26-2/i2) (identidade e rastreio), [I3](https://github.com/ods-26-2/i3) (geometria e
-calibração) e [A4](https://github.com/ods-26-2/a4) (arbitragem). Nenhum importa o outro: eles conversam pelo
-Kafka do projeto, no envelope de `docs/INV-1_interfaces.md`, seguindo o guia
-`docs/Guia_Kafka_B2_v2.pdf`. A cadeia completa está no README do [A4](https://github.com/ods-26-2/a4).
+[![i2-tests](https://github.com/ods-26-2/i2/actions/workflows/i2-tests.yml/badge.svg)](https://github.com/ods-26-2/i2/actions/workflows/i2-tests.yml)
 
-Só numpy + cliente Kafka.
+**Afirma que o objeto deste quadro é o mesmo do quadro anterior.** Componente da camada 2
+(inferência) do ODS 2026/2, do squad INV-1. Recebe as detecções por quadro do
+[I1](https://github.com/ods-26-2/i1) e publica, para cada câmera, rastros com identidade estável
+em `ods.i2.tracks`, que o S1 e o S2 consomem.
 
-## Rodar
-
+```mermaid
+flowchart LR
+    P4["P4 / P6<br/>quadros"] --> I1["I1<br/>ods.i1.detections"]
+    I1 --> I2["<b>I2</b><br/>ods.i2.tracks"]
+    I2 --> S1["S1<br/>zonas e posição"]
+    I2 --> S2["S2<br/>correlação entre fontes"]
+    S1 --> A["A3 · A4 · A5 · A8"]
 ```
+
+Serve a qualquer aplicação: a classe de cada rastro é a do modelo do I1 (`person`, `vehicle`,
+`ball`, `piece`...), sem lista fixa, e cada câmera tem o seu estado. Na 6c o I2 não usa modelo
+(P2 só entraria com ReID neural).
+
+## Início rápido
+
+```bash
 docker build -t inv-i2 .
-# csv de exemplo vem do repo a4, clonado ao lado
-cat ../a4/old/yolo/volei.csv ../a4/old/yolo/janela.csv | sort -t, -k1,1n | docker run -i --rm inv-i2 --fps 29.97 --largura 1280 --altura 720
-# no barramento: mesmo comando + --kafka 34.66.235.91:9093
 
-# ao vivo, lendo o I1 do barramento (Ctrl+C para parar)
-docker run --rm --network host inv-i2 --i1 localhost:9092 --kafka localhost:9092 --fps 29.97 --largura 1280 --altura 720
+# ao vivo: lê o I1 do broker e publica no mesmo broker (Ctrl+C ou docker stop para parar)
+docker run --rm --network host inv-i2 --i1 localhost:9092 --kafka localhost:9092 --fps 30
+#   Kafka da Jetson (rede do DCOMP): --i1 172.18.4.56:9092 --kafka 172.18.4.56:9092
+
+# offline: csv de detecções no stdin, eventos no stdout
+docker run -i --rm inv-i2 --fps 30 --largura 1280 --altura 720 < dados/deteccoes_exemplo.csv
 ```
 
-Entrada, com `--i1`: o tópico `ods.i1.detections` do [I1](https://github.com/ods-26-2/i1) (MOD-1), do fim
-em diante. `captured_at`, `source_id` e `session_id` de cada quadro passam direto para o
-rastro; sessão nova zera os rastros e o `sequence`. Quadro repetido ou fora de ordem na
-mesma sessão é descartado.
+O passo a passo, com Kafka local, testes e o produtor falso, está em [HOW_TO_RUN.md](HOW_TO_RUN.md).
+O contrato, a semântica e a operação estão em [docs/CONTRATO.md](docs/CONTRATO.md).
 
-Entrada, sem `--i1` (stdin): csv de detecções `quadro,t_s,x1,y1,x2,y2,classe,confianca`, **ordenado por
-quadro**. Linhas de cabeçalho são ignoradas, então dá para concatenar vários csv e passar
-por `sort`. É o formato do antigo produtor falso `old/yolo/detectar.py` do [A4](https://github.com/ods-26-2/a4);
-os csv de exemplo também estão lá (`old/yolo/volei.csv`, `old/yolo/janela.csv`). O `detection_id` é a
-ordem da linha dentro do quadro, contada antes do corte de confiança.
+## Saída
 
-Saída: um evento `ods.i2.tracks` por quadro, no envelope EV-SINAL da arquitetura 6c, como
-linha JSON no stdout ou, com `--kafka`, no tópico de mesmo nome (chave `source_id`). É
-streaming: cada quadro sai assim que o seguinte começa a chegar. A métrica
-`trocas_por_minuto` vai para o stderr.
+Um evento por quadro, inclusive sem objetos, no envelope EV-SINAL da 6c, validado contra
+[`schemas/ods.i2.tracks.v1.0.schema.json`](schemas/ods.i2.tracks.v1.0.schema.json) antes de sair:
 
 ```json
-{"frame_index": 48, "tracks": [{"track_id": "t-ball-0001", "detection_id": 0, "class": "ball",
-  "state": "CONFIRMED", "predicted": false, "confidence": 0.78,
-  "point_px": [744.0, 271], "bbox": [739, 260, 749, 271]}]}
+{"schema": "ods.i2.tracks", "producer": "I2", "source_id": "cam0", "session_id": "9c2a…",
+ "sequence": 48213, "captured_at": "2026-09-23T14:29:59.870Z", "artifact_version": "i2-rastreio-2.0",
+ "payload": {"frame_index": 48213, "tracks": [
+   {"track_id": "t-person-0391", "detection_id": 0, "class": "person", "state": "CONFIRMED",
+    "predicted": false, "confidence": 0.9, "point_px": [505, 702], "bbox": [412, 180, 598, 702]}]}}
 ```
 
 - `point_px` é o centro da base da `bbox`, o ponto que o S1 projeta pela homografia do I3.
-- `bbox` é a da detecção, sem suavização; com `predicted` ela é extrapolada e sai sem
-  `detection_id`.
-- `state` `LOST` sai uma vez, no quadro em que o rastro encerra. Objeto que volta recebe
+- `predicted: true` quando o objeto não foi detectado no quadro e a posição é extrapolada
+  (oclusão); aí não há `detection_id`.
+- `LOST` sai uma vez, no quadro em que o rastro encerra. Objeto que sai e volta recebe
   `track_id` novo (decisão da 6c para a 1.0).
 
-Opções: `--source-id --sessao` (uuid; padrão é um novo) `--fps --largura --altura --inicio` (ISO do quadro 0, base do
-`captured_at`), `--conf-min bola=0.5,pessoa=0.3`, `--kafka HOST:PORTA`, `--i1 HOST:PORTA`, `--objetos bola=1,pessoa=12`.
+## Opções
 
-Entram detecções de I1 (MOD-1). Consumidores: S1 e S2.
+| opção | para quê |
+|---|---|
+| `--i1 HOST:PORTA` | lê `ods.i1.detections` do broker; sem ela, lê csv do stdin |
+| `--kafka HOST:PORTA` | publica em `ods.i2.tracks`; sem ela, uma linha json por evento no stdout |
+| `--fps` | taxa da câmera (padrão 30); escala o raio de busca e a vida sem detecção |
+| `--perfis ARQUIVO.json` | perfis do rastreador por classe, configuração da build da aplicação |
+| `--conf-min ball=0.5,person=0.3` | corte extra de confiança por classe (padrão: nenhum, vale o do MODEL no I1) |
+| `--objetos ball=1,person=12` | densidade declarada do cenário, para a métrica |
+| `--source-id`, `--sessao`, `--inicio`, `--largura`, `--altura` | só no modo csv; com `--i1` vêm de cada mensagem |
 
-**Entrada** `Deteccao(caixa, classe, confianca, id)` + `t_s`, via `atualizar_quadro(t_s, deteccoes)`
+## Perfis por aplicação
 
-| campo | formato | observação |
-|---|---|---|
-| `caixa` | `(x1, y1, x2, y2)` em px | cantos superior esquerdo e inferior direito |
-| `classe` | str | `"bola"`, `"pessoa"` |
-| `confianca` | float 0 a 1 | do contrato de I1, ainda não usada |
-| `id` | int ou None | `detection_id` de I1 no quadro |
-| `t_s` | float em s | timestamp de **captura**, não de chegada |
+Toda classe usa o perfil padrão (objeto grande e lento, em que o problema é a oclusão). A classe
+`ball` tem perfil próprio: objeto pequeno e rápido, em que o problema é a predição. A build de
+cada aplicação pode trocar ou acrescentar perfis sem mexer no código:
 
-**Saída** `Trilha(id, classe, estado, centro, t_s, visto, vistas, caixa, deteccao, confianca)`
+```json
+{"versao": "perfis-a8-1",
+ "classes": {"vehicle": {"dist_max_px": 150, "ambiguo_px": 60, "confirmar_em": 3, "perder_apos": 30,
+                         "suavizacao": 0.5, "cresce": 0.0, "teto": 1.0, "horizontes_s": 60.0}}}
+```
 
-| campo | formato | observação |
-|---|---|---|
-| `id` | int | a identidade, o produto do componente |
-| `estado` | str | `tentativa`, `confirmada`, `perdida` |
-| `centro` | `(u, v)` em px | predito quando `visto` é falso |
-| `visto` | bool | houve detecção neste quadro ou é predição |
-| `caixa` | `(x1, y1, x2, y2)` em px | da detecção; deslocada com o centro quando predita |
-| `deteccao` | int ou None | id da detecção associada; None quando predita |
-| `confianca` | float 0 a 1 | da última detecção associada |
+- **A4 (vôlei):** a bola usa o perfil `ball` embutido; nada a configurar.
+- **A8 (estacionamento):** `vehicle` usa o padrão, ou um perfil próprio como o acima. A versão do
+  arquivo entra no `artifact_version` (`i2-rastreio-2.0+perfis-a8-1`).
 
-**O que importa**
+## A métrica
 
-- Dois regimes, um motor só. Pessoa é grande e lenta, o problema é oclusão. Bola é
-  pequena e rápida, o problema é predição. Dois perfis num dict, mesmo contrato de saída.
-- A predição por velocidade constante é o que carrega a trilha pelos quadros em que a
-  bola borra. Sem ela, a identidade troca.
-- Raio de busca é calibrado pra uma câmera de referência (1920px, 30fps) e escala com
-  `ParametrosCamera` — outra resolução ou outro fps, outro raio. Sem isso o perfil
-  calibrado numa câmera erra silenciosamente na próxima.
-- Métrica: `trocas_por_minuto()`, sobre cenário gravado do B4.
+Trocas de identidade por minuto, sob a densidade declarada em `--objetos`: identidades
+confirmadas além das esperadas, por minuto de sessão. Sai no stderr ao fim de cada sessão de cada
+câmera, por classe.
+
+## Estrutura
+
+```
+I2/
+├── rastreio/
+│   ├── rastreador.py   o motor: associação, predição, cruzamento, encerramento
+│   ├── perfis.py       perfis por classe e o --perfis da build
+│   ├── entrada.py      ods.i1.detections (Kafka) e o csv legado
+│   ├── pipeline.py     estado por câmera e sessão, sequence, métrica
+│   ├── contrato.py     envelope ods.i2.tracks e o validador do schema
+│   └── publicacao.py   stdout ou Kafka, validando antes de publicar
+├── tests/              suíte (python -m unittest discover -s I2/tests -t I2)
+├── mock_producer.py    produtor falso para quem consome o I2
+└── run_rastreio.py     linha de comando
+schemas/                contrato ods.i2.tracks com exemplos válidos e inválidos
+dados/                  csv de exemplo (pessoa, veículo e bola, 1 s)
+main.py                 ponto de entrada (Docker, B4, cadeia)
+```
+
+Parte do INV-1 · ODS 2026/2, com [I3](https://github.com/ods-26-2/i3) (geometria e calibração) e
+[A4](https://github.com/ods-26-2/a4) (arbitragem). Nenhum importa o outro: eles conversam pelo
+Kafka, no envelope da Arquitetura 6c.

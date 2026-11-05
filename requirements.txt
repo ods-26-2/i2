@@ -1,2 +1,4 @@
+# versoes validadas em 2026-11-05 (python 3.14)
 numpy==2.5.3
 confluent-kafka==2.16.0
+jsonschema==4.26.0

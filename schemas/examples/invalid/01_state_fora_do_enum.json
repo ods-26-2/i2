@@ -1,0 +1,36 @@
+{
+  "message_type": "event",
+  "message_id": "5f1e2c7a-9b1d-4e0a-8c6f-2d3a4b5c6d7e",
+  "schema": "ods.i2.tracks",
+  "schema_version": "1.0",
+  "producer": "I2",
+  "published_at": "2026-09-23T14:30:00.140Z",
+  "captured_at": "2026-09-23T14:29:59.870Z",
+  "source_id": "cam0",
+  "session_id": "9c2a1f3e-4d5b-4c6a-9e8f-0a1b2c3d4e5f",
+  "sequence": 48213,
+  "artifact_version": "i2-rastreio-2.0",
+  "payload": {
+    "frame_index": 48213,
+    "tracks": [
+      {
+        "track_id": "t-person-0391",
+        "detection_id": 0,
+        "class": "person",
+        "state": "TENTATIVE",
+        "predicted": false,
+        "confidence": 0.9,
+        "point_px": [
+          505,
+          702
+        ],
+        "bbox": [
+          412,
+          180,
+          598,
+          702
+        ]
+      }
+    ]
+  }
+}

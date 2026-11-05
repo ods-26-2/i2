@@ -1,0 +1,25 @@
+# suite do I2 a cada envio: contrato ods.i2.tracks, rastreio e a chamada que o B4 usa.
+# nenhum job publica no Kafka.
+name: i2-tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Suite (rastreio, perfis, entrada, pipeline, contrato, linha de comando)
+        run: python -m unittest discover -s I2/tests -t I2 -v
+      - name: Produtor falso emite eventos validos
+        run: python I2/mock_producer.py --quadros 12 > /dev/null
