@@ -202,7 +202,8 @@ def main(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source-id", default="cam-ref")
+    # --camera-id: nome de antes da 6c, ainda usado pela suite do B4
+    p.add_argument("--source-id", "--camera-id", dest="source_id", default="cam-ref")
     p.add_argument("--sessao", default=str(uuid.uuid4()),
                    help="session_id (uuid) de ods.session.started; padrao e um novo")
     p.add_argument("--fps", type=float, default=30.0)
